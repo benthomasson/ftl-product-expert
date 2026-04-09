@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+*.db
+.product-expert/
+entries/
+beliefs.md
+nogoods.md
+proposed-beliefs.md
+proposed-derivations.md
+network.json
+uv.lock

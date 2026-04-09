@@ -1,0 +1,158 @@
+"""Exploration topics queue for product expert."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+
+
+@dataclass
+class Topic:
+    """A queued exploration topic."""
+    title: str
+    kind: str       # feature, epic, roadmap, user-story, feedback, general
+    target: str     # issue ID, feature name, or slug
+    source: str = ""
+    status: str = "pending"
+    added: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+
+
+TOPIC_KINDS = {"feature", "epic", "roadmap", "user-story", "feedback", "general"}
+
+PROJECT_DIR = ".product-expert"
+
+
+def _queue_path(project_dir: str | None = None) -> str:
+    if project_dir is None:
+        project_dir = PROJECT_DIR
+    return os.path.join(project_dir, "topics.json")
+
+
+def load_queue(project_dir: str | None = None) -> list[Topic]:
+    path = _queue_path(project_dir)
+    if not os.path.isfile(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return [Topic(**item) for item in data]
+
+
+def save_queue(queue: list[Topic], project_dir: str | None = None) -> None:
+    if project_dir is None:
+        project_dir = PROJECT_DIR
+    os.makedirs(project_dir, exist_ok=True)
+    path = _queue_path(project_dir)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump([asdict(t) for t in queue], f, indent=2)
+
+
+def add_topics(topics: list[Topic], project_dir: str | None = None) -> int:
+    queue = load_queue(project_dir)
+    existing_targets = {t.target for t in queue}
+    added = 0
+    for topic in topics:
+        if topic.target not in existing_targets:
+            queue.append(topic)
+            existing_targets.add(topic.target)
+            added += 1
+    if added:
+        save_queue(queue, project_dir)
+    return added
+
+
+def pop_next(project_dir: str | None = None) -> Topic | None:
+    queue = load_queue(project_dir)
+    for topic in queue:
+        if topic.status == "pending":
+            topic.status = "done"
+            save_queue(queue, project_dir)
+            return topic
+    return None
+
+
+def pop_at(index: int, project_dir: str | None = None) -> Topic | None:
+    queue = load_queue(project_dir)
+    pending = [i for i, t in enumerate(queue) if t.status == "pending"]
+    if index < 0 or index >= len(pending):
+        return None
+    queue[pending[index]].status = "done"
+    save_queue(queue, project_dir)
+    return queue[pending[index]]
+
+
+def pop_multiple(indices: list[int], project_dir: str | None = None) -> list[Topic | None]:
+    queue = load_queue(project_dir)
+    pending = [i for i, t in enumerate(queue) if t.status == "pending"]
+    results = []
+    valid_queue_indices = []
+    for idx in indices:
+        if idx < 0 or idx >= len(pending):
+            results.append(None)
+        else:
+            qi = pending[idx]
+            results.append(queue[qi])
+            valid_queue_indices.append(qi)
+    if valid_queue_indices:
+        for qi in valid_queue_indices:
+            queue[qi].status = "done"
+        save_queue(queue, project_dir)
+    return results
+
+
+def skip_topic(index: int, project_dir: str | None = None) -> bool:
+    queue = load_queue(project_dir)
+    pending = [i for i, t in enumerate(queue) if t.status == "pending"]
+    if index < 0 or index >= len(pending):
+        return False
+    queue[pending[index]].status = "skipped"
+    save_queue(queue, project_dir)
+    return True
+
+
+def pending_count(project_dir: str | None = None) -> int:
+    return sum(1 for t in load_queue(project_dir) if t.status == "pending")
+
+
+# --- Parsing topics from model output ---
+
+TOPIC_LINE_PATTERN = re.compile(
+    r"^[-*]\s+"
+    r"\[(\w[\w-]*)\]\s+"
+    r"`([^`]+)`"
+    r"\s*(?:—|-|:)\s*"
+    r"(.+)$",
+    re.MULTILINE,
+)
+
+
+def parse_topics_from_response(response: str, source: str = "") -> list[Topic]:
+    section_match = re.search(
+        r"#+\s*Topics?\s+to\s+Explore\s*\n(.*?)(?=\n#|\Z)",
+        response,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not section_match:
+        return []
+
+    section_text = section_match.group(1)
+    topics = []
+
+    for match in TOPIC_LINE_PATTERN.finditer(section_text):
+        kind = match.group(1).lower()
+        target = match.group(2)
+        title = match.group(3).strip()
+
+        if kind not in TOPIC_KINDS:
+            kind = "general"
+
+        topics.append(Topic(
+            title=title,
+            kind=kind,
+            target=target,
+            source=source,
+        ))
+
+    return topics
