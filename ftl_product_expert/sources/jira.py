@@ -30,6 +30,7 @@ class JiraSource:
         self.user = user or os.environ.get("JIRA_USER", "")
         self.token = token or os.environ.get("JIRA_TOKEN", "")
         self.platform = "jira"
+        self._next_page_token = None
 
         if not self.base_url:
             raise ValueError("JIRA_URL not set. Set env var or pass url=")
@@ -49,12 +50,26 @@ class JiraSource:
         resp.raise_for_status()
         return resp.json()
 
+    def _post(self, path: str, json_body: dict) -> dict:
+        """Make authenticated POST request to Jira API."""
+        url = f"{self.base_url}/rest/api/3/{path.lstrip('/')}"
+        resp = requests.post(
+            url,
+            json=json_body,
+            auth=(self.user, self.token),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def list_issues(
         self,
         jql: str | None = None,
         state: str | None = None,
         labels: list[str] | None = None,
         limit: int = 100,
+        page: int = 1,
     ) -> list[Issue]:
         """List issues from the project.
 
@@ -62,24 +77,44 @@ class JiraSource:
             jql: Custom JQL query. If not set, builds one from project/state/labels.
             state: Filter by status category (e.g., "To Do", "In Progress", "Done")
             labels: Filter by labels
-            limit: Max results
+            limit: Max results per page
+            page: Page number (1-based). Uses cursor-based pagination internally;
+                  page 1 starts fresh, subsequent pages use stored cursor.
         """
         if jql is None:
             parts = [f'project = "{self.project}"']
             if state:
-                parts.append(f'statusCategory = "{state}"')
+                if state.lower() in ("open", "opened"):
+                    parts.append('statusCategory != "Done"')
+                elif state.lower() in ("closed", "done"):
+                    parts.append('statusCategory = "Done"')
+                else:
+                    parts.append(f'statusCategory = "{state}"')
             if labels:
                 label_clause = " AND ".join(f'labels = "{l}"' for l in labels)
                 parts.append(f"({label_clause})")
             jql = " AND ".join(parts) + " ORDER BY updated DESC"
 
-        data = self._get("search", params={
+        fields = [
+            "summary", "description", "status", "labels", "assignee",
+            "reporter", "priority", "issuetype", "parent", "issuelinks",
+            "created", "updated", "resolutiondate", "comment", "fixVersions",
+        ]
+
+        body: dict = {
             "jql": jql,
             "maxResults": limit,
-            "fields": "summary,description,status,labels,assignee,reporter,"
-                      "priority,issuetype,parent,issuelinks,created,updated,"
-                      "resolutiondate,comment,fixVersions",
-        })
+            "fields": fields,
+        }
+
+        if page == 1:
+            self._next_page_token = None
+        if self._next_page_token:
+            body["nextPageToken"] = self._next_page_token
+
+        data = self._post("search/jql", body)
+
+        self._next_page_token = data.get("nextPageToken")
 
         return [self._normalize(raw) for raw in data.get("issues", [])]
 
