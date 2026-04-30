@@ -15,6 +15,7 @@ import click
 from .llm import check_model_available, invoke, invoke_sync
 from .prompts import (
     PROPOSE_BELIEFS_PRODUCT,
+    REVIEW_PROPOSALS_PROMPT,
     build_explore_prompt,
     build_ingest_prompt,
     build_scan_prompt,
@@ -999,6 +1000,160 @@ def accept_beliefs(proposals_file):
     _accept_proposals(matches)
 
 
+# --- review-proposals ---
+
+
+def _load_existing_beliefs_text() -> str:
+    """Load existing IN beliefs as compact text for dedup context."""
+    if _has_reasons() and Path("reasons.db").exists():
+        result = subprocess.run(["reasons", "list"], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            lines = []
+            for line in result.stdout.splitlines():
+                if line.strip().startswith("[+]"):
+                    lines.append(line.strip())
+            return "\n".join(lines) if lines else "(No existing beliefs)"
+    beliefs_path = Path("beliefs.md")
+    if beliefs_path.exists():
+        text = beliefs_path.read_text()
+        lines = []
+        for line in text.splitlines():
+            if re.match(r"^### \S+ \[IN\]", line):
+                lines.append(line)
+        return "\n".join(lines) if lines else "(No existing beliefs)"
+    return "(No existing beliefs)"
+
+
+def _parse_all_proposals(text: str) -> list[dict]:
+    """Parse all proposals from a proposed-beliefs.md file."""
+    pattern = re.compile(
+        r"^### \[?(?:ACCEPT(?:/REJECT)?|REJECT)\]? (\S+)\n(.+?)\n- Source: (.+?)(?:\n|$)",
+        re.MULTILINE,
+    )
+    proposals = []
+    for m in pattern.finditer(text):
+        proposals.append({
+            "id": m.group(1),
+            "text": m.group(2).strip(),
+            "source": m.group(3).strip(),
+        })
+    return proposals
+
+
+@cli.command("review-proposals")
+@click.option("--file", "proposals_file", default="proposed-beliefs.md",
+              help="Proposals file to review (default: proposed-beliefs.md)")
+@click.option("--batch-size", type=int, default=20,
+              help="Proposals per LLM batch (default: 20)")
+@click.pass_context
+def review_proposals(ctx, proposals_file, batch_size):
+    """Review proposed beliefs for quality before accepting.
+
+    Classifies each proposal as ok, meta, duplicate, ephemeral, stale,
+    or speculative. Rewrites the proposals file with ACCEPT for ok beliefs
+    and REJECT for flagged ones.
+
+    Example:
+        product-expert propose-beliefs
+        product-expert review-proposals
+        product-expert accept-beliefs
+    """
+    model = ctx.obj["model"]
+    timeout = ctx.obj["timeout"]
+
+    if not check_model_available(model):
+        click.echo(f"Error: Model '{model}' CLI not available", err=True)
+        sys.exit(1)
+
+    proposals_path = Path(proposals_file)
+    if not proposals_path.exists():
+        click.echo(f"Proposals file not found: {proposals_file}")
+        click.echo("Run: product-expert propose-beliefs")
+        sys.exit(1)
+
+    proposals = _parse_all_proposals(proposals_path.read_text())
+    if not proposals:
+        click.echo("No proposals found in file.")
+        return
+
+    click.echo(f"Reviewing {len(proposals)} proposals...", err=True)
+
+    existing_beliefs = _load_existing_beliefs_text()
+
+    # Batch proposals for LLM review
+    classifications = {}
+    batches = [proposals[i:i + batch_size] for i in range(0, len(proposals), batch_size)]
+
+    for i, batch in enumerate(batches):
+        click.echo(f"  Batch {i + 1}/{len(batches)} ({len(batch)} proposals)...", err=True)
+
+        proposals_text = "\n\n".join(
+            f"### [ACCEPT/REJECT] {p['id']}\n{p['text']}\n- Source: {p['source']}"
+            for p in batch
+        )
+
+        prompt = REVIEW_PROPOSALS_PROMPT.format(
+            existing_beliefs=existing_beliefs,
+            proposals=proposals_text,
+        )
+
+        try:
+            result = invoke_sync(prompt, model=model, timeout=timeout)
+        except Exception as e:
+            click.echo(f"  ERROR: {e}", err=True)
+            for p in batch:
+                classifications[p["id"]] = "ok"
+            continue
+
+        # Parse classifications from response
+        class_pattern = re.compile(
+            r"^### \[?(ok|meta|duplicate|ephemeral|stale|speculative)\]? (\S+)",
+            re.MULTILINE | re.IGNORECASE,
+        )
+        for m in class_pattern.finditer(result):
+            category = m.group(1).lower()
+            belief_id = m.group(2)
+            classifications[belief_id] = category
+
+        # Any proposals not classified default to ok
+        for p in batch:
+            if p["id"] not in classifications:
+                classifications[p["id"]] = "ok"
+
+    # Count by category
+    from collections import Counter
+    counts = Counter(classifications.values())
+    ok_count = counts.get("ok", 0)
+    rejected_count = len(proposals) - ok_count
+
+    click.echo(f"\nResults: {ok_count} ok, {rejected_count} rejected", err=True)
+    for cat in ["meta", "duplicate", "ephemeral", "stale", "speculative"]:
+        if counts.get(cat, 0) > 0:
+            click.echo(f"  {cat}: {counts[cat]}", err=True)
+
+    # Rewrite proposals file
+    with proposals_path.open("w") as f:
+        f.write("# Proposed Beliefs (Reviewed)\n\n")
+        f.write(f"**Reviewed:** {date.today().isoformat()}\n")
+        f.write(f"**Model:** {model}\n")
+        f.write(f"**Results:** {ok_count} accepted, {rejected_count} rejected\n\n---\n\n")
+
+        for p in proposals:
+            category = classifications.get(p["id"], "ok")
+            if category == "ok":
+                f.write(f"### [ACCEPT] {p['id']}\n")
+            else:
+                f.write(f"### [REJECT] {p['id']}\n")
+            f.write(f"{p['text']}\n")
+            f.write(f"- Source: {p['source']}\n")
+            if category != "ok":
+                f.write(f"- Quality: {category}\n")
+            f.write("\n")
+
+    click.echo(f"Rewrote {proposals_path}")
+    click.echo("Run: product-expert accept-beliefs")
+
+
 # --- derive ---
 
 
@@ -1438,14 +1593,16 @@ def status():
               help="Max issues per page for scan (default: 100)")
 @click.pass_context
 def update(ctx, since_str, since_last, limit):
-    """Automated update pipeline: scan, explore, propose, derive, summarize.
+    """Automated update pipeline: scan, explore, propose, review, accept, derive, summarize.
 
     Runs the full pipeline in one command:
       1. scan --all-pages (with optional --since filtering)
-      2. explore --loop 1000 (drain pending topics)
-      3. propose-beliefs --auto (extract and accept beliefs)
-      4. derive --exhaust (compute all logical consequences)
-      5. generate-summary (update report entry)
+      2. explore --loop (drain pending topics)
+      3. propose-beliefs (extract candidate beliefs)
+      4. review-proposals (quality filter)
+      5. accept-beliefs (import reviewed beliefs)
+      6. derive --exhaust (compute all logical consequences)
+      7. generate-summary (update report entry)
 
     Example:
         product-expert update --since-last
@@ -1479,7 +1636,7 @@ def update(ctx, since_str, since_last, limit):
     # Step 2: explore all pending topics
     click.echo("\n=== Step 2: Explore pending topics ===\n", err=True)
     try:
-        ctx.invoke(explore, loop_max=1000)
+        ctx.invoke(explore, loop_max=99)
     except SystemExit as e:
         if e.code and e.code != 0:
             errors.append(f"explore exited with code {e.code}")
@@ -1488,10 +1645,10 @@ def update(ctx, since_str, since_last, limit):
         errors.append(f"explore: {e}")
         click.echo(f"WARN: explore failed: {e}, continuing...", err=True)
 
-    # Step 3: propose-beliefs --auto
-    click.echo("\n=== Step 3: Propose and accept beliefs ===\n", err=True)
+    # Step 3: propose-beliefs
+    click.echo("\n=== Step 3: Propose beliefs ===\n", err=True)
     try:
-        ctx.invoke(propose_beliefs, auto_accept=True)
+        ctx.invoke(propose_beliefs)
     except SystemExit as e:
         if e.code and e.code != 0:
             errors.append(f"propose-beliefs exited with code {e.code}")
@@ -1500,8 +1657,32 @@ def update(ctx, since_str, since_last, limit):
         errors.append(f"propose-beliefs: {e}")
         click.echo(f"WARN: propose-beliefs failed: {e}, continuing...", err=True)
 
-    # Step 4: derive --exhaust
-    click.echo("\n=== Step 4: Derive (exhaust) ===\n", err=True)
+    # Step 4: review-proposals
+    click.echo("\n=== Step 4: Review proposals ===\n", err=True)
+    try:
+        ctx.invoke(review_proposals)
+    except SystemExit as e:
+        if e.code and e.code != 0:
+            errors.append(f"review-proposals exited with code {e.code}")
+            click.echo(f"WARN: review-proposals failed (exit {e.code}), continuing...", err=True)
+    except Exception as e:
+        errors.append(f"review-proposals: {e}")
+        click.echo(f"WARN: review-proposals failed: {e}, continuing...", err=True)
+
+    # Step 5: accept-beliefs
+    click.echo("\n=== Step 5: Accept beliefs ===\n", err=True)
+    try:
+        ctx.invoke(accept_beliefs)
+    except SystemExit as e:
+        if e.code and e.code != 0:
+            errors.append(f"accept-beliefs exited with code {e.code}")
+            click.echo(f"WARN: accept-beliefs failed (exit {e.code}), continuing...", err=True)
+    except Exception as e:
+        errors.append(f"accept-beliefs: {e}")
+        click.echo(f"WARN: accept-beliefs failed: {e}, continuing...", err=True)
+
+    # Step 6: derive --exhaust
+    click.echo("\n=== Step 6: Derive (exhaust) ===\n", err=True)
     try:
         ctx.invoke(derive, exhaust=True)
     except SystemExit as e:
@@ -1512,8 +1693,8 @@ def update(ctx, since_str, since_last, limit):
         errors.append(f"derive: {e}")
         click.echo(f"WARN: derive failed: {e}, continuing...", err=True)
 
-    # Step 5: generate-summary
-    click.echo("\n=== Step 5: Generate summary ===\n", err=True)
+    # Step 7: generate-summary
+    click.echo("\n=== Step 7: Generate summary ===\n", err=True)
     try:
         ctx.invoke(generate_summary, snapshot_ids=tuple(pre_run_ids))
     except SystemExit as e:
